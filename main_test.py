@@ -103,16 +103,26 @@ async def lm(effects: list, palettes: dict) -> dict:
         {json.dumps(palettes, indent=2)}
 
         Rules:
-        1. Choose an effect name EXACTLY (or the best fitting match) from the available effects list.
-        2. DEFAULT PALETTE RULE: Palette 0 is "Default". Unless the user explicitly requests a specific color scheme, theme, or named palette, ALWAYS default to "palette_id": 0 and "uses_palette": false. Do not guess, invent, or select arbitrary palettes. Many effects (like "Rainbow") produce their intended look natively under the Default palette (0).
-        3. Set "can_have_palette" to true if the chosen effect's "palette" flag is true, else false.
-        4. If the user explicitly asks for a single/custom color or explicitly specifies "no palette", set "uses_palette": false and "palette_id": 0.
-        5. ONLY set "uses_palette": true and choose a non-zero "palette_id" if BOTH conditions are met:
-           - "can_have_palette" is true.
-           - The user explicitly requested a specific color palette (e.g., "Party", "Ocean", "Fire") or a distinct multi-color scheme that directly matches an available palette name.
-        6. If "can_have_palette" is false, set "uses_palette": false and "palette_id": null.
-        7. Provide a primary color as a HEX string (e.g., "#FF5733") matching the requested color (or "#FFFFFF" if no specific color is mentioned).
-        8. Brightness must be an integer between 1 and 255.
+1. EFFECT SELECTION:
+   - Select the effect from the available effects list that best fits the motion or vibe requested.
+   - Set "can_have_palette" to true if the selected effect's "palette" flag is true, else false.
+
+2. PALETTE DECISION LOGIC:
+   Palette 0 is "Default" (uses the primary color or native multi-color logic). When "can_have_palette" is true:
+   - SET "uses_palette": false AND "palette_id": 0 IF:
+     * The user asks for a single solid color (e.g., "blink red", "breathing cyan", "no palette").
+     * The effect natively generates its own multi-color look without needing an external palette (e.g., "Rainbow").
+     * The request only describes a pure motion pattern with zero color or thematic keywords (e.g., "chase", "wipe", "scan"). Do NOT pick random palettes for generic motions.
+   - SET "uses_palette": true AND PICK A MATCHING "palette_id" IF:
+     * The user describes a theme, mood, nature scene, or color palette (e.g., "forest leaves", "fire/flame", "sunset", "ocean waves", "party vibes") that maps naturally to an available palette name.
+     * The user explicitly names a palette from the list.
+
+3. FALLBACK WHEN CANNOT USE PALETTE:
+   - If "can_have_palette" is false, always set "uses_palette": false and "palette_id": null.
+
+4. PRIMARY COLOR & BRIGHTNESS:
+   - "primary_color": Provide a matching HEX string (e.g., "#228B22" for forest, "#FF0000" for red). If a palette is used, set this to the dominant theme color or "#FFFFFF".
+   - "brightness": Integer from 1 to 255 (match descriptive words like "soft", "dim", "bright", or default to 128-200).
         """
 
         chat = lms.Chat(system_prompt)
