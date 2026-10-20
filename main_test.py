@@ -1,5 +1,6 @@
 import asyncio
 from pprint import pprint
+from typing import Optional
 
 from wled import WLED
 from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
@@ -33,108 +34,110 @@ async def resolve_mdns(device_name: str) -> str:
 async def main() -> None:
     ip_address = await resolve_mdns("buubuu.local")
 
-    """Show example of controlling your WLED device."""
     async with WLED(ip_address) as led:
         device = await led.update()
-        dev_effects = device.effects
-        effects = [{
-            "name": dev_effects[i].name,
-            "palette": dev_effects[i].metadata.palette,
-        } for i in dev_effects.keys()]
-        # for x in dev_effects.keys():
-        #     pprint(dev_effects[x])
-        dev_palettes = device.palettes
-        # for x in dev_palettes.keys():
-        #     pprint(dev_palettes[x])
-        # while True:
-        effect_chosen = await asyncio.gather(lm(effects, dev_palettes))
-        effect_chosen = effect_chosen[0]
 
-        if not effect_chosen["can_have_palette"]:
-            effect_chosen["palette"] = False
-        effect_chosen["primary_color"] = ImageColor.getcolor(effect_chosen["primary_color"], "RGB")
+        # Simplify effects list
+        effects = [
+            {
+                "name": effect.name,
+                "palette": effect.metadata.palette,
+            }
+            for effect in device.effects.values()
+        ]
 
-        pprint(effect_chosen)
-        print(dev_palettes[effect_chosen["palette"]])
-        print(effect_chosen["brightness"])
-        print(type(effect_chosen["brightness"]))
-        await led.segment(
-            0,
-            effect= effect_chosen["name"],
-            palette= effect_chosen["palette"],
-            color_primary= effect_chosen["primary_color"],
-            brightness= int(effect_chosen["brightness"]),
-        )
-        await led.master(on=True)
+        # Map palette_id -> name (ignoring custom field)
+        dev_palettes = {
+            palette.palette_id: palette.name
+            for palette in device.palettes.values()
+        }
+
+        effect_chosen = await lm(effects, dev_palettes)
+        # pprint(effect_chosen)
+
+        # Parse primary color to RGB tuple
+        rgb_color = ImageColor.getcolor(effect_chosen["primary_color"], "RGB")
+
+        segment_kwargs = {
+            "effect": effect_chosen["name"],
+            "color_primary": rgb_color,
+        }
+
+        # If the user chose a palette, apply it; otherwise, use palette 0 (Default) to ensure solid primary colors work
+        if effect_chosen.get("uses_palette") and effect_chosen.get("palette_id") is not None:
+            segment_kwargs["palette"] = effect_chosen["palette_id"]
+            print(f"Selected palette: {dev_palettes.get(effect_chosen['palette_id'], 'Unknown')}")
+        else:
+            segment_kwargs["palette"] = 0  # Forces WLED to use the custom primary color slot
+            print(f"Using solid primary color: {effect_chosen['primary_color']}")
+
+        await led.segment(0, **segment_kwargs)
+        await led.master(on=True, brightness=int(effect_chosen["brightness"]))
 
 
-class EffectShema(BaseModel):
+class EffectSchema(BaseModel):
     name: str
     can_have_palette: bool
+    uses_palette: bool
     brightness: int
-    palette: int
+    palette_id: Optional[int] = None
     primary_color: str
 
 
-async def lm(effects: list, palettes: dict):
+async def lm(effects: list, palettes: dict) -> dict:
     async with lms.AsyncClient() as client:
+        # model = await client.llm.model("prism-ml/bonsai-27b")
         model = await client.llm.model("qwen/qwen3.5-9b")
 
         session = PromptSession()
         with patch_stdout():
             effect_prompt = await session.prompt_async("Tell me what effect do you need?\n    ")
 
-        # 1. SYSTEM PROMPT: Defines role, rules, and provides context data
         system_prompt = f"""You are a WLED lighting control assistant.
-        Your task is to select the best lighting effect and its parameters based on the user's request.
+        Your task is to select the best lighting effect and parameters based on the user's request.
 
-Available effects:
-{json.dumps(effects, indent=2)}
+        Available effects:
+        {json.dumps(effects, indent=2)}
 
-Available palettes (key -> name):
-{json.dumps(palettes, indent=2)}
+        Available palettes (palette_id -> name):
+        {json.dumps(palettes, indent=2)}
 
-Rules:
-1. Choose an effect name EXACTLY from the available effects list.
-2. If the effect supports a palette, select the best matching palette ID (the dictionary key) from the available palettes.
-3. If the effect does NOT support a palette, set "palette" to false and provide a primary color as a HEX string (e.g., "#FF5733").
-4. Brightness must be an integer between 0 and 255.
-5. Return ONLY a valid JSON object matching this structure:
-{{
-  "name": "<exact effect name>",
-  "can_have_palette": true/false,
-  "brightness": <0-255>,
-  "palette": "<palette_id>" or false,
-  "primary_color": "<HEX string if no palette>"
-}}"""
+        Rules:
+        1. Choose an effect name EXACTLY (or the best fitting match) from the available effects list.
+        2. DEFAULT PALETTE RULE: Palette 0 is "Default". Unless the user explicitly requests a specific color scheme, theme, or named palette, ALWAYS default to "palette_id": 0 and "uses_palette": false. Do not guess, invent, or select arbitrary palettes. Many effects (like "Rainbow") produce their intended look natively under the Default palette (0).
+        3. Set "can_have_palette" to true if the chosen effect's "palette" flag is true, else false.
+        4. If the user explicitly asks for a single/custom color or explicitly specifies "no palette", set "uses_palette": false and "palette_id": 0.
+        5. ONLY set "uses_palette": true and choose a non-zero "palette_id" if BOTH conditions are met:
+           - "can_have_palette" is true.
+           - The user explicitly requested a specific color palette (e.g., "Party", "Ocean", "Fire") or a distinct multi-color scheme that directly matches an available palette name.
+        6. If "can_have_palette" is false, set "uses_palette": false and "palette_id": null.
+        7. Provide a primary color as a HEX string (e.g., "#FF5733") matching the requested color (or "#FFFFFF" if no specific color is mentioned).
+        8. Brightness must be an integer between 1 and 255.
+        """
 
-        # 2. USER PROMPT: Contains the dynamic user request
-        user_prompt = f"Effect I need is: {effect_prompt}"
+        chat = lms.Chat(system_prompt)
+        chat.add_user_message(f"Effect I need is: {effect_prompt}")
 
-        # 3. MESSAGES ARRAY: Standard OpenAI/LM Studio message format
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-
-        # Pass messages instead of a raw string.
-        # response_format expects the Pydantic JSON schema
         prediction = await model.respond_stream(
-            messages=messages,
-            response_format=EffectShema.model_json_schema()
+            chat,
+            response_format=EffectSchema.model_json_schema(),
         )
 
         async for fragment in prediction:
             print(fragment.content, end="", flush=True)
         print()
 
-        # LM Studio may return a dict or a JSON string. Handle both safely.
         raw_result = prediction.result().content if hasattr(prediction, 'result') else str(prediction)
-        effect_chosen = raw_result if isinstance(raw_result, dict) else json.loads(raw_result)
 
-        print("Parsed result:\n", effect_chosen, "\n")
+        if isinstance(raw_result, str):
+            # Strip any synthetic thinking delimiters or trailing text
+            start_idx = raw_result.find("{")
+            end_idx = raw_result.rfind("}")
+            if start_idx != -1 and end_idx != -1:
+                raw_result = raw_result[start_idx: end_idx + 1]
+
+        effect_chosen = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
         return effect_chosen
-
 
 
 if __name__ == "__main__":
